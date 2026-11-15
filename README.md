@@ -1,4 +1,4 @@
-# declarch 0.2
+# declarch
 
 Declarative configuration for CachyOS / Arch. Describe your system in `.arch` files (TOML syntax); `declarch` makes the machine match. Idempotent, with generations and rollback.
 
@@ -58,9 +58,3 @@ A split layout (see `example/split/`):
 
 ## How apply works
 Load + merge -> build action list -> snapshot via snapper (if present) -> run actions -> save the whole config folder as a generation in `/var/lib/declarch/generations/` -> record managed packages/files/links in `state.json`.
-
-## Limitations
-Not NixOS: no atomic builds or version pinning; rollback re-applies config, so use the snapper snapshot for a filesystem-level revert. Run `plan` before enabling `prune`. Untested on a live system as of 0.2.0.
-
-## Ideas for later
-Systemd user services, bootloader/kernel params, auto-apply timer, per-host profiles.
