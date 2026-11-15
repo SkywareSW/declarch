@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""declarch 0.2.1 - declarative system configuration for CachyOS / Arch Linux."""
+import argparse, json, os, shutil, socket, subprocess, sys, time, tomllib
+from pathlib import Path
+
+CONF = "/etc/declarch/configuration.arch"
+LIB = Path("/var/lib/declarch"); STATE = LIB / "state.json"; GENS = LIB / "generations"
+KNOWN = {"system", "packages", "services", "users", "sysctl", "files", "links",
+         "environment", "kernel", "hooks"}
+
+def run(cmd, user=None):
+    if user: cmd = ["sudo", "-u", user] + cmd
+    return subprocess.run(cmd, text=True).returncode
+
+def out(cmd):
+    r = subprocess.run(cmd, text=True, capture_output=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+def ok(cmd):
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+def rd(p):
+    try: return Path(p).read_text()
+    except OSError: return None
+
+def write(p, body, mode):
+    Path(p).parent.mkdir(parents=True, exist_ok=True)
+    Path(p).write_text(body); os.chmod(p, mode)
+
+def link(t, s):
+    p = Path(t); p.parent.mkdir(parents=True, exist_ok=True)
+    if p.is_symlink(): p.unlink()
+    elif p.exists(): p.rename(t + ".declarch-bak")
+    p.symlink_to(s)
+
+def set_locale(loc):
+    g = Path("/etc/locale.gen")
+    g.write_text("\n".join(l[1:] if l.startswith(f"#{loc} ") else l
+                           for l in g.read_text().splitlines()) + "\n")
+    run(["locale-gen"]); Path("/etc/locale.conf").write_text(f"LANG={loc}\n")
+
+def aur_install(pkgs):
+    h = next((x for x in ("paru", "yay") if shutil.which(x)), None)
+    u = os.environ.get("SUDO_USER")
+    if not (h and u): sys.exit("AUR packages need paru/yay and running via sudo")
+    run([h, "-S", "--needed", "--noconfirm", *pkgs], u)
+
+def load_state():
+    try: s = json.loads(STATE.read_text())
+    except (OSError, ValueError): s = {}
+    return {k: s.get(k, []) for k in ("packages", "files", "links")}
+
+# ---- config loading with imports -------------------------------------------
+def merge(a, b):
+    for k, v in b.items():
+        if isinstance(a.get(k), dict) and isinstance(v, dict): merge(a[k], v)
+        elif isinstance(a.get(k), list) and isinstance(v, list): a[k] += [x for x in v if x not in a[k]]
+        else: a[k] = v
+    return a
+
+def load(path, seen=()):
+    path = Path(path).resolve()
+    if path in seen: sys.exit(f"import cycle at {path}")
+    try: cfg = tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as e: sys.exit(f"{path}: {e}")
+    merged = {}
+    for pat in cfg.pop("imports", []):
+        hits = sorted(path.parent.glob(pat))
+        if not hits and not any(c in pat for c in "*?["):
+            sys.exit(f"{path.name}: import not found: {pat}")
+        for h in hits: merge(merged, load(h, seen + (path,)))
+    return merge(merged, cfg)      # importing file wins over its imports
+
+# ---- plan ------------------------------------------------------------------
+def build(cfg, base, state):
+    A = []
+    add = lambda d, f: A.append((d, f))
+    s = cfg.get("system", {})
+    if (h := s.get("hostname")) and (rd("/etc/hostname") or "").strip() != h:
+        add(f"hostname -> {h}", lambda h=h: run(["hostnamectl", "set-hostname", h]))
+    if (tz := s.get("timezone")) and out(["timedatectl", "show", "-p", "Timezone", "--value"]) != tz:
+        add(f"timezone -> {tz}", lambda tz=tz: run(["timedatectl", "set-timezone", tz]))
+    if (km := s.get("keymap")) and f"KEYMAP={km}" not in (rd("/etc/vconsole.conf") or ""):
+        add(f"keymap -> {km}", lambda km=km: run(["localectl", "set-keymap", km]))
+    if (loc := s.get("locale")) and f"LANG={loc}" not in (rd("/etc/locale.conf") or ""):
+        add(f"locale -> {loc}", lambda loc=loc: set_locale(loc))
+
+    pk = cfg.get("packages", {})
+    pac, aur, fp = pk.get("pacman", []), pk.get("aur", []), pk.get("flatpak", [])
+    have = set(out(["pacman", "-Qq"]).split())
+    if m := [p for p in pac if p not in have]:
+        add("pacman install: " + " ".join(m),
+            lambda m=m: run(["pacman", "-S", "--needed", "--noconfirm", *m]))
+    if m := [p for p in aur if p not in have]:
+        add("AUR install: " + " ".join(m), lambda m=m: aur_install(m))
+    if fp and shutil.which("flatpak"):
+        fh = set(out(["flatpak", "list", "--app", "--columns=application"]).split())
+        if m := [p for p in fp if p not in fh]:
+            add("flatpak install: " + " ".join(m),
+                lambda m=m: run(["flatpak", "install", "-y", "--noninteractive", "flathub", *m]))
+    if pk.get("prune", False):
+        want = set(pac + aur)
+        if m := [p for p in state["packages"] if p not in want and p in have]:
+            add("pacman remove (no longer declared): " + " ".join(m),
+                lambda m=m: run(["pacman", "-Rns", "--noconfirm", *m]))
+
+    sv = cfg.get("services", {})
+    for u in sv.get("enable", []):
+        if not (ok(["systemctl", "is-enabled", u]) and ok(["systemctl", "is-active", u])):
+            add(f"enable {u}", lambda u=u: run(["systemctl", "enable", "--now", u]))
+    for u in sv.get("disable", []):
+        if ok(["systemctl", "is-enabled", u]) or ok(["systemctl", "is-active", u]):
+            add(f"disable {u}", lambda u=u: run(["systemctl", "disable", "--now", u]))
+
+    for name, u in cfg.get("users", {}).items():
+        gs, sh = u.get("groups", []), u.get("shell")
+        if not ok(["id", name]):
+            cmd = ["useradd", "-m"] + (["-s", sh] if sh else []) + (["-G", ",".join(gs)] if gs else []) + [name]
+            add(f"create user {name}", lambda c=cmd: run(c))
+            continue
+        if gs and not set(gs) <= set(out(["id", "-nG", name]).split()):
+            add(f"user {name}: add groups {gs}", lambda n=name, g=gs: run(["usermod", "-aG", ",".join(g), n]))
+        if sh and out(["getent", "passwd", name]).split(":")[-1] != sh:
+            add(f"user {name}: shell -> {sh}", lambda n=name, sh=sh: run(["usermod", "-s", sh, n]))
+
+    files = {}
+    for path, f in cfg.get("files", {}).items():
+        body = f["content"] if "content" in f else (base / f["source"]).read_text()
+        files[path] = (body, int(str(f.get("mode", "0644")), 8))
+    if cfg.get("sysctl"):
+        files["/etc/sysctl.d/99-declarch.conf"] = (
+            "".join(f"{k} = {v}\n" for k, v in cfg["sysctl"].items()), 0o644)
+    if cfg.get("environment"):
+        files["/etc/environment.d/90-declarch.conf"] = (
+            "".join(f"{k}={v}\n" for k, v in cfg["environment"].items()), 0o644)
+    if mods := cfg.get("kernel", {}).get("modules"):
+        files["/etc/modules-load.d/declarch.conf"] = ("\n".join(mods) + "\n", 0o644)
+    for path, (body, mode) in files.items():
+        if rd(path) != body:
+            add(f"write {path}", lambda p=path, b=body, m=mode: write(p, b, m))
+    for p in state["files"]:
+        if p not in files and Path(p).exists():
+            add(f"remove {p}", lambda p=p: Path(p).unlink())
+
+    links = {t: str((base / s).resolve()) for t, s in cfg.get("links", {}).items()}
+    for t, s in links.items():
+        if not (Path(t).is_symlink() and os.readlink(t) == s):
+            add(f"link {t} -> {s}", lambda t=t, s=s: link(t, s))
+    for t in state["links"]:
+        if t not in links and Path(t).is_symlink():
+            add(f"unlink {t}", lambda t=t: Path(t).unlink())
+
+    if A:
+        hk = cfg.get("hooks", {})
+        A = [(f"pre-hook: {c}", lambda c=c: run(["sh", "-c", c])) for c in hk.get("pre_apply", [])] + A
+        for c in hk.get("post_apply", []):
+            add(f"post-hook: {c}", lambda c=c: run(["sh", "-c", c]))
+    return A, files, links, pac + aur
+
+def apply(path, dry):
+    path = Path(path).resolve(); cfg = load(path)
+    A, files, links, pkgs = build(cfg, path.parent, load_state())
+    if not A: return print("Already in sync.")
+    for d, _ in A: print(("  would: " if dry else "  ->  ") + d)
+    if dry: return
+    if os.geteuid(): sys.exit("apply needs root: sudo declarch apply")
+    if shutil.which("snapper"): run(["snapper", "create", "-d", "declarch pre-apply"])
+    for _, f in A: f()
+    GENS.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(path.parent, GENS / str(int(time.time())), dirs_exist_ok=True)
+    STATE.write_text(json.dumps({"packages": pkgs, "files": list(files), "links": list(links)}))
+    print("Applied.")
+
+def check(path):
+    cfg = load(path)
+    if bad := set(cfg) - KNOWN: sys.exit("unknown sections: " + ", ".join(sorted(bad)))
+    pk = cfg.get("packages", {})
+    print(f"OK: {len(pk.get('pacman', []))} pacman, {len(pk.get('aur', []))} aur, "
+          f"{len(pk.get('flatpak', []))} flatpak, {len(cfg.get('services', {}).get('enable', []))} services")
+
+def init(path):
+    q = lambda l: ("\n" + "".join(f'    "{x}",\n' for x in sorted(l))) if l else ""
+    p = Path(path)
+    if p.exists(): sys.exit(f"{p} exists, not overwriting")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(f'''# declarch configuration. Everything lives here by default.
+# Want to organize? Optionally split into more .arch files:
+#   imports = ["packages.arch", "modules/*.arch"]
+
+[system]
+hostname = "{socket.gethostname()}"
+# timezone = "Europe/Nicosia"
+# locale = "en_US.UTF-8"
+# keymap = "us"
+
+[packages]
+prune = false   # set true once you trust this list
+pacman = [{q(out(["pacman", "-Qqen"]).split())}]
+aur = [{q(out(["pacman", "-Qqem"]).split())}]
+flatpak = []
+
+[services]
+enable = []
+disable = []
+''')
+    print(f"Wrote {p}")
+
+def gens():
+    return sorted(GENS.iterdir()) if GENS.exists() else []
+
+def main():
+    ap = argparse.ArgumentParser(prog="declarch")
+    ap.add_argument("-c", "--config", default=CONF)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for n in ("plan", "apply", "init", "check", "upgrade", "edit", "generations"): sub.add_parser(n)
+    sub.add_parser("rollback").add_argument("gen", nargs="?")
+    a = ap.parse_args()
+    if a.cmd == "init": init(a.config)
+    elif a.cmd == "check": check(a.config)
+    elif a.cmd == "plan": apply(a.config, True)
+    elif a.cmd == "apply": apply(a.config, False)
+    elif a.cmd == "upgrade":
+        if os.geteuid(): sys.exit("upgrade needs root")
+        run(["pacman", "-Syu", "--noconfirm"]); apply(a.config, False)
+    elif a.cmd == "edit":
+        run([os.environ.get("EDITOR", "nano"), a.config]); check(a.config); apply(a.config, True)
+    elif a.cmd == "generations":
+        for g in gens(): print(g.name, time.strftime("%F %T", time.localtime(int(g.name))))
+    elif a.cmd == "rollback":
+        g = gens(); pick = a.gen or (g[-2].name if len(g) > 1 else None)
+        if not pick: sys.exit("no earlier generation")
+        apply(str(GENS / pick / Path(a.config).name), False)
+
+if __name__ == "__main__":
+    main()
